@@ -1,0 +1,109 @@
+ONLINE VIDEO DEPTH ANYTHING (oVDA)
+==================================
+
+Input: one RGB frame at a time from a monocular video.
+Output: one relative depth map per frame, at the current time step.
+The first frame produces a depth map immediately. Later predictions use
+cached features from earlier frames to improve temporal consistency.
+
+1. WHAT HAPPENS WHEN A FRAME ARRIVES
+
+1) Preprocess the RGB frame and pass it through DINOv2. The encoder
+   produces four intermediate feature maps for this frame. Temporal
+   information enters in the depth head.
+2) The spatiotemporal head reassembles the feature maps at different
+   resolutions. It combines spatial refinement with temporal attention
+   in the Motion Modules.
+3) At each temporal attention layer, the current frame supplies the
+   query. Recent cached features and the current feature supply the
+   attention context. The attention operates across time for each
+   spatial location in the feature map.
+4) The head fuses and upsamples the refined features to produce the
+   current depth map. Each temporal attention layer saves its current
+   hidden feature for future frames. Earlier depth maps stay as emitted.
+
+2. HOW THE oVDA CACHE STARTS AND FILLS
+
+Frame 0: The history is empty. The Motion Modules use single-frame
+self-attention. The model emits depth and stores the first features.
+
+Frames 1 onward: Each new frame uses the history available at that point.
+As more frames arrive, the cache grows to its configured size. Once
+full, it slides forward by dropping the oldest entry as a new one is
+added. The paper uses a default context-length setting of c = 16.
+Each new video starts with empty temporal state.
+
+3. WHAT IS CACHED AND WHY K AND V ARE RECOMPUTED
+
+Let h_t be the current hidden feature and C be the assembled context
+of cached hidden features and h_t. Schematically, omitting heads:
+
+  Q = PE(h_t) W_Q
+  K = PE(C)   W_K
+  V = PE(C)   W_V
+  attention = softmax(Q K^T / sqrt(d_head)) V
+
+PE supplies temporal position information. W_Q, W_K and W_V are
+learned projections. As the window shifts, a retained feature can move
+to a different slot and receive a different positional encoding. The
+paper's implementation reprojects the context with its current slot
+positions. For additive PE, a possible optimization is to cache the
+content projection h W_K and add the slot term PE_slot W_K separately,
+with the same idea for V. That uses linearity and is an implementation
+option, not the published inference path.
+
+4. HOW THE MODEL LEARNS TO RUN ONLINE
+
+oVDA starts from VDA-Small weights. It freezes DINOv2 and fine-tunes
+the spatiotemporal head. Training can process a clip in parallel, using
+a causal mask so each frame can attend to itself and earlier frames.
+A scale-and-shift consistency loss helps reduce drift across frames.
+At inference, the model uses the cache to produce each depth map as
+the frame arrives.
+
+5. BYTEDANCE VDA STREAMING DEMO AND THE 41-FRAME GAP
+
+The public VDA repository also includes run_streaming.py, which calls
+infer_video_depth_one() in video_depth_stream.py. That demo uses a
+different cache policy from the oVDA paper.
+
+Its first frame is encoded once. The demo fills 32 cache slots with
+references to that first frame's temporal state. Starting at frame 1,
+it selects two entries from the front and the latest 29 entries from
+the back. Those 31 historical slots plus the incoming frame give 32
+positions to the temporal head. During startup, some slots refer to
+the same first frame.
+
+The source computes the gap from the VDA inference constants:
+
+  gap = 2 * (INFER_LEN - OVERLAP) - 1 - (OVERLAP - INTERP_LEN)
+      = 2 * (32 - 10) - 1 - (10 - 8)
+      = 41
+
+After each prediction, the demo appends the new state. It starts
+deleting cache entry 1 after processing zero-based frame 11, because
+11 + 32 > 41 + 1. Entry 0 remains pinned to frame 0. Early deletions
+remove the extra frame-0 references. These are the states selected
+before appending each current frame:
+
+  Current frame    First two slots    Latest 29 slots
+       1                 0, 0         29 copies of frame 0
+      30                 0, 0         frames 1 through 29
+      41                 0, 0         frames 12 through 40
+      42                 0, 1         frames 13 through 41
+      43                 0, 2         frames 14 through 42
+
+From frame 42 onward, the second slot refers to frame t - 41. The
+number 41 is the age of that reference in steady state. Depth output
+starts at frame 0 and continues throughout startup.
+
+REFERENCES
+
+oVDA paper, Sections 3.1-3.4 and Appendix A.4
+https://arxiv.org/html/2510.09182v1
+
+Video Depth Anything streaming entry point
+https://github.com/DepthAnything/Video-Depth-Anything/blob/main/run_streaming.py
+
+Video Depth Anything cache implementation
+https://github.com/DepthAnything/Video-Depth-Anything/blob/main/video_depth_anything/video_depth_stream.py
